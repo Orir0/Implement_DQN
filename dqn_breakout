@@ -1,0 +1,233 @@
+from torch import nn
+import torch
+import gymnasium as gym
+from collections import deque
+import itertools
+import random
+import numpy as np
+import ale_py 
+from gymnasium.wrappers import AtariPreprocessing, FrameStackObservation
+import os
+
+
+# Create saved_models directory if it doesn't exist
+os.makedirs('saved_models', exist_ok=True)
+
+GAMMA = 0.99 # dicount factor
+BATCH_SIZE = 32 
+BUFFER_SIZE = 1000000 # this is the replay buffer - SGD updates are sampled from this number of most recent frames
+MIN_REPLAY_SIZE = 50000 # Uniform random policy will run for this number of frames before learning starts and the
+#resultin experience is used to populate the replay memory
+AGNET_HISTROY_LEN = 4 # the number of most recent frames experienced by the agent that are given as input to the Q network
+EPSILON_START = 1.0 
+EPSILON_END = 0.02 
+EPSILON_DECAY = 1000000
+TARGET_UPDATE_FREQ = 10000  #every 10000 steps the target neworks update
+ACTION_REPEAT = 4 # the agent will repeat the same action for this number of frames
+UPDATE_FREQUENCY = 4 # the number of steps between SGD update
+LEARNING_RATE = 0.00025 # the learning rate for the optimizer
+GRADIENT_MOMENTUM = 0.95
+MIN_SQUARED_GRADIENT = 0.01 
+INITIAL_EXPLORATION = 1 #initial value of eps in eps-greedy exploration
+FINAL_EXPLORATION = 0.1 #final value of eps 
+NO_OP_MAX = 30 # max number of 'do nothing' actions to be performed by the agent at the start of an episode
+
+
+#basee enviroment
+env = gym.make('ALE/Breakout-v5', frameskip=1) # this version of breakout alread has frame skip = 4 by default
+
+#apply preprocessing - PRE PROCESSING START
+env  = AtariPreprocessing(
+    env,
+    screen_size=84,
+    frame_skip=4,
+    grayscale_obs=True,
+    scale_obs=True,
+    noop_max= NO_OP_MAX
+) #this are the defualt for this function - just wrote them for clarity
+
+env = FrameStackObservation(env, stack_size=4)
+# PREPROCESSING FINISHED
+
+
+#creating the neural network
+class ConvolutionalNetwork(nn.Module):
+    def __init__(self, env):
+        super().__init__()
+        
+        # Convolutional layers
+        self.conv = nn.Sequential(
+            # Conv1: 32 filters, 8x8, stride 4
+            nn.Conv2d(4, 32, kernel_size=8, stride=4),
+            nn.ReLU(),
+            
+            # Conv2: 64 filters, 4x4, stride 2
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),
+            nn.ReLU(),
+            
+            # Conv3: 64 filters, 3x3, stride 1
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.ReLU()
+        )
+        
+        # Calculate flattened size after conv layers
+        # Input: 84x84x4
+        # After Conv1 (stride 4): ~20x20x32
+        # After Conv2 (stride 2): ~9x9x64
+        # After Conv3 (stride 1): ~7x7x64 = 3136
+        
+        # Fully connected layers
+        self.fc = nn.Sequential(
+            # FC1: 512 units
+            nn.Linear(7 * 7 * 64, 512),
+            nn.ReLU(),
+            
+            # Output: one per action
+            nn.Linear(512, env.action_space.n)
+        )
+    
+    def forward(self, x):
+        # x shape: (batch, 4, 84, 84)
+        x = self.conv(x)  # (batch, 64, 7, 7)
+        x = x.view(x.size(0), -1)  # Flatten: (batch, 3136)
+        x = self.fc(x)  # (batch, num_actions)
+        return x
+    
+    def act(self, obs, device):
+        obs_t = torch.as_tensor(obs, dtype=torch.float32)
+        obs_t = obs_t.unsqueeze(0).to(device)  # Move to same device as model
+
+        q_values = self(obs_t)
+
+        action = q_values.argmax(dim=1)[0].item()
+
+        return action
+    
+
+#Setting up the replay buffer & reward buffer for tracking
+replay_buffer = deque(maxlen = BUFFER_SIZE)
+rew_buffer = deque([0.0], maxlen =100)
+episode_reward = 0.0
+
+online_net = ConvolutionalNetwork(env)
+target_net = ConvolutionalNetwork(env)
+
+# Move networks to GPU if available
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+online_net = online_net.to(device)
+target_net = target_net.to(device)
+
+
+#As the paper stated we'll use RMSprop optimizer
+optimizer = torch.optim.RMSprop(
+    online_net.parameters(),
+    lr=LEARNING_RATE,           # 0.00025
+    alpha=GRADIENT_MOMENTUM,    # 0.95 (decay factor)
+    eps=MIN_SQUARED_GRADIENT,   # 0.01 (epsilon)
+    momentum=0,                 # RMSprop doesn't use momentum
+    centered=False
+)
+
+
+#initiating the repay buffer
+obs, _ = env.reset()
+for _ in range(MIN_REPLAY_SIZE):
+    action = env.action_space.sample()
+
+    new_obs, rew, done, truncated, _= env.step(action)
+    transition = (obs, action, rew, done, new_obs)
+    replay_buffer.append(transition)
+    obs = new_obs
+
+    if done:
+        obs,_ = env.reset()
+
+#MAIN TRAINING LOOP
+obs, _ = env.reset()
+
+for step in itertools.count():
+    epsilon = np.interp(step, [0, EPSILON_DECAY], [EPSILON_START, EPSILON_END])
+
+    random_sample = random.random()
+
+    # Choose action (explore or exploit)
+    if random_sample <= epsilon:
+        action = env.action_space.sample()
+    else:
+        action = online_net.act(obs, device)
+    
+    # Always step the environment
+    new_obs, rew, done, truncated, _ = env.step(action)
+    transition = (obs, action, rew, done, new_obs)
+    replay_buffer.append(transition)
+    obs = new_obs
+    episode_reward += rew
+
+    if done or truncated:
+        obs, _ = env.reset()
+        rew_buffer.append(episode_reward)
+        episode_reward = 0.0
+    
+    # Only train if we have enough samples and it's time to update
+    if len(replay_buffer) < MIN_REPLAY_SIZE:
+        continue
+    
+    if step % UPDATE_FREQUENCY != 0:
+        continue
+    
+    transitions = random.sample(replay_buffer, BATCH_SIZE)
+
+    obses = np.asarray([t[0] for t in transitions])
+    actions = np.asarray([t[1] for t in transitions])
+    rews = np.asarray([t[2] for t in transitions])
+    dones = np.asarray([t[3] for t in transitions])
+    new_obses = np.asarray([t[4] for t in transitions])
+
+    obses_t = torch.as_tensor(obses,dtype=torch.float32).to(device)
+    actions_t = torch.as_tensor(actions, dtype=torch.int64).unsqueeze(-1).to(device)
+    rews_t = torch.as_tensor(rews, dtype=torch.float32).unsqueeze(-1).to(device)
+    dones_t = torch.as_tensor(dones, dtype= torch.float32).unsqueeze(-1).to(device)
+    new_obses_t = torch.as_tensor(new_obses, dtype=torch.float32).to(device)
+
+
+    #compute target
+    target_q_values = target_net(new_obses_t)
+    max_target_q_values = target_q_values.max(dim=1, keepdim=True)[0]
+
+    targets = rews_t + GAMMA*(1-dones_t)*max_target_q_values
+
+    #comptue loss
+    q_values = online_net(obses_t)
+
+    action_q_values = torch.gather(input=q_values, dim=1, index=actions_t)
+
+    loss = nn.functional.smooth_l1_loss(action_q_values, targets)
+
+    #gradient descent step
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+    #update network
+
+    if step % TARGET_UPDATE_FREQ == 0:
+        target_net.load_state_dict(online_net.state_dict())
+        # Save model checkpoint
+        checkpoint_path = f'saved_models/checkpoint_step_{step}.pth'
+        
+        torch.save({
+            'step': step,
+            'online_net_state_dict': online_net.state_dict(),
+            'target_net_state_dict': target_net.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'avg_reward': np.mean(rew_buffer) if len(rew_buffer) > 0 else 0.0,
+        }, checkpoint_path)
+        print(f"Model saved to: {checkpoint_path}")
+
+    #logging
+    if step % 1000 == 0:
+        print()
+        print(f"step: {step}")
+        print(f'Avg Reward {np.mean(rew_buffer) if len(rew_buffer) > 0 else 0.0}')
+        print(f'Episodes completed: {len(rew_buffer)}')
+        print(f'Current episode reward: {episode_reward:.2f}')
