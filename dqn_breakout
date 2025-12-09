@@ -212,6 +212,8 @@ for step in itertools.count():
 
     if step % TARGET_UPDATE_FREQ == 0:
         target_net.load_state_dict(online_net.state_dict())
+        
+    if step % 50000 == 0:
         # Save model checkpoint
         checkpoint_path = f'saved_models/checkpoint_step_{step}.pth'
         
@@ -224,7 +226,7 @@ for step in itertools.count():
         }, checkpoint_path)
         print(f"Model saved to: {checkpoint_path}")
 
-    #logging
+    #loggingp
     if step % 1000 == 0:
         print()
         print(f"step: {step}")
