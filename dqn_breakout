@@ -8,6 +8,8 @@ import numpy as np
 import ale_py 
 from gymnasium.wrappers import AtariPreprocessing, FrameStackObservation
 import os
+import env_preprocessing
+from convolutionnet import ConvolutionalNetwork 
 
 
 # Create saved_models directory if it doesn't exist
@@ -20,7 +22,7 @@ MIN_REPLAY_SIZE = 50000 # Uniform random policy will run for this number of fram
 #resultin experience is used to populate the replay memory
 AGNET_HISTROY_LEN = 4 # the number of most recent frames experienced by the agent that are given as input to the Q network
 EPSILON_START = 1.0 
-EPSILON_END = 0.02 
+EPSILON_END = 0.1
 EPSILON_DECAY = 1000000
 TARGET_UPDATE_FREQ = 10000  #every 10000 steps the target neworks update
 ACTION_REPEAT = 4 # the agent will repeat the same action for this number of frames
@@ -33,81 +35,17 @@ FINAL_EXPLORATION = 0.1 #final value of eps
 NO_OP_MAX = 30 # max number of 'do nothing' actions to be performed by the agent at the start of an episode
 
 
-#basee enviroment
-env = gym.make('ALE/Breakout-v5', frameskip=1) # this version of breakout alread has frame skip = 4 by default
-
-#apply preprocessing - PRE PROCESSING START
-env  = AtariPreprocessing(
-    env,
-    screen_size=84,
-    frame_skip=4,
-    grayscale_obs=True,
-    scale_obs=True,
-    noop_max= NO_OP_MAX
-) #this are the defualt for this function - just wrote them for clarity
-
-env = FrameStackObservation(env, stack_size=4)
-# PREPROCESSING FINISHED
+env = env_preprocessing.make_atari_breakout_enviroment_for_dqn()
 
 
-#creating the neural network
-class ConvolutionalNetwork(nn.Module):
-    def __init__(self, env):
-        super().__init__()
-        
-        # Convolutional layers
-        self.conv = nn.Sequential(
-            # Conv1: 32 filters, 8x8, stride 4
-            nn.Conv2d(4, 32, kernel_size=8, stride=4),
-            nn.ReLU(),
-            
-            # Conv2: 64 filters, 4x4, stride 2
-            nn.Conv2d(32, 64, kernel_size=4, stride=2),
-            nn.ReLU(),
-            
-            # Conv3: 64 filters, 3x3, stride 1
-            nn.Conv2d(64, 64, kernel_size=3, stride=1),
-            nn.ReLU()
-        )
-        
-        # Calculate flattened size after conv layers
-        # Input: 84x84x4
-        # After Conv1 (stride 4): ~20x20x32
-        # After Conv2 (stride 2): ~9x9x64
-        # After Conv3 (stride 1): ~7x7x64 = 3136
-        
-        # Fully connected layers
-        self.fc = nn.Sequential(
-            # FC1: 512 units
-            nn.Linear(7 * 7 * 64, 512),
-            nn.ReLU(),
-            
-            # Output: one per action
-            nn.Linear(512, env.action_space.n)
-        )
-    
-    def forward(self, x):
-        # x shape: (batch, 4, 84, 84)
-        x = self.conv(x)  # (batch, 64, 7, 7)
-        x = x.view(x.size(0), -1)  # Flatten: (batch, 3136)
-        x = self.fc(x)  # (batch, num_actions)
-        return x
-    
-    def act(self, obs, device):
-        obs_t = torch.as_tensor(obs, dtype=torch.float32)
-        obs_t = obs_t.unsqueeze(0).to(device)  # Move to same device as model
-
-        q_values = self(obs_t)
-
-        action = q_values.argmax(dim=1)[0].item()
-
-        return action
     
 
 #Setting up the replay buffer & reward buffer for tracking
 replay_buffer = deque(maxlen = BUFFER_SIZE)
-rew_buffer = deque([0.0], maxlen =100)
-episode_reward = 0.0
+epinfo_buffer = deque([], maxlen =100)
+episode_count = 0
+episode_reward =0
+
 
 online_net = ConvolutionalNetwork(env)
 target_net = ConvolutionalNetwork(env)
@@ -117,6 +55,13 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 online_net = online_net.to(device)
 target_net = target_net.to(device)
 
+# Set networks to train mode
+online_net.train()
+target_net.train()
+
+# Initialize target network with online network weights
+
+target_net.load_state_dict(online_net.state_dict())
 
 #As the paper stated we'll use RMSprop optimizer
 optimizer = torch.optim.RMSprop(
@@ -129,22 +74,11 @@ optimizer = torch.optim.RMSprop(
 )
 
 
-#initiating the repay buffer
-obs, _ = env.reset()
-for _ in range(MIN_REPLAY_SIZE):
-    action = env.action_space.sample()
 
-    new_obs, rew, done, truncated, _= env.step(action)
-    transition = (obs, action, rew, done, new_obs)
-    replay_buffer.append(transition)
-    obs = new_obs
-
-    if done:
-        obs,_ = env.reset()
 
 #MAIN TRAINING LOOP
-obs, _ = env.reset()
-
+obs, info = env.reset()
+curr_life = info['lives']
 for step in itertools.count():
     epsilon = np.interp(step, [0, EPSILON_DECAY], [EPSILON_START, EPSILON_END])
 
@@ -157,21 +91,37 @@ for step in itertools.count():
         action = online_net.act(obs, device)
     
     # Always step the environment
-    new_obs, rew, done, truncated, _ = env.step(action)
+    new_obs, rew, done, truncated, info = env.step(action)
+    # Clip rewards as per DQN paper: positive rewards clipped to +1, negative to -1, 0 unchanged
+    rew = np.clip(rew, -1, 1)
+    episode_reward += rew
+    
+    
+    # Save the transition from the agent's action
     transition = (obs, action, rew, done, new_obs)
     replay_buffer.append(transition)
     obs = new_obs
-    episode_reward += rew
-
+  
+    # If All lives lost beging new game
     if done or truncated:
-        obs, _ = env.reset()
-        rew_buffer.append(episode_reward)
-        episode_reward = 0.0
+        epinfo_buffer.append(episode_reward)
+        episode_reward = 0
+        episode_count += 1
+        obs, info = env.reset()
+        for _ in range(random.randint(1,30)):
+                obs, _, _, _, _ = env.step(1)
+    
+    # If we lost one live and still have some remaining we need to fire the ball into play
+    if info['lives'] < curr_life:
+        curr_life = info['lives']
+        for _ in range(random.randint(1,30)):
+                obs, _, _, _, _ = env.step(1)
     
     # Only train if we have enough samples and it's time to update
     if len(replay_buffer) < MIN_REPLAY_SIZE:
         continue
     
+    # number of steps between SGD step
     if step % UPDATE_FREQUENCY != 0:
         continue
     
@@ -190,14 +140,14 @@ for step in itertools.count():
     new_obses_t = torch.as_tensor(new_obses, dtype=torch.float32).to(device)
 
 
-    #compute target
     target_q_values = target_net(new_obses_t)
     max_target_q_values = target_q_values.max(dim=1, keepdim=True)[0]
-
+    
     targets = rews_t + GAMMA*(1-dones_t)*max_target_q_values
 
     #comptue loss
-    q_values = online_net(obses_t)
+    with torch.no_grad():
+        q_values = online_net(obses_t)
 
     action_q_values = torch.gather(input=q_values, dim=1, index=actions_t)
 
@@ -206,14 +156,23 @@ for step in itertools.count():
     #gradient descent step
     optimizer.zero_grad()
     loss.backward()
+    # Gradient clipping for stability (as per DQN paper)
+    torch.nn.utils.clip_grad_norm_(online_net.parameters(), max_norm=10.0)
     optimizer.step()
+    
+    # Store loss and Q-value stats for logging
+    last_loss = loss.item()
+    with torch.no_grad():
+        last_q_mean = q_values.mean().item()
+        last_q_max = q_values.max().item()
+        last_target_mean = targets.mean().item()
 
-    #update network
-
-    if step % TARGET_UPDATE_FREQ == 0:
+    #update target network (but not at step 0, since we already initialized it)
+    if step > 0 and step % TARGET_UPDATE_FREQ == 0:
         target_net.load_state_dict(online_net.state_dict())
+        print(f"Target network updated at step {step}")
         
-    if step % 50000 == 0:
+    if step % 100000 == 0 and step != 0:
         # Save model checkpoint
         checkpoint_path = f'saved_models/checkpoint_step_{step}.pth'
         
@@ -222,14 +181,14 @@ for step in itertools.count():
             'online_net_state_dict': online_net.state_dict(),
             'target_net_state_dict': target_net.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
-            'avg_reward': np.mean(rew_buffer) if len(rew_buffer) > 0 else 0.0,
         }, checkpoint_path)
         print(f"Model saved to: {checkpoint_path}")
 
-    #loggingp
-    if step % 1000 == 0:
+    #logging
+    if step % 1000 == 0 and step !=0:
+        rew_mean = np.mean(epinfo_buffer) 
         print()
         print(f"step: {step}")
-        print(f'Avg Reward {np.mean(rew_buffer) if len(rew_buffer) > 0 else 0.0}')
-        print(f'Episodes completed: {len(rew_buffer)}')
-        print(f'Current episode reward: {episode_reward:.2f}')
+        print(f'average reward: {rew_mean}')
+        print(f'episode count: {episode_count}')
+
