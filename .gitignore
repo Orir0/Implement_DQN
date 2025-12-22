@@ -35,3 +35,10 @@ Thumbs.db
 dist/
 build/
 *.egg-info/
+
+#
+MnihEtAlHassibis15NatureControlDeepRL.pdf 
+
+# LyX temporary/backup files
+*.lyx~
+#Guide.lyx#
